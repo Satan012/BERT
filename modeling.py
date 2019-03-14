@@ -26,6 +26,8 @@ import re
 import six
 import tensorflow as tf
 
+import numpy as np
+
 
 class BertConfig(object):
   """Configuration for `BertModel`."""
@@ -133,7 +135,7 @@ class BertModel(object):
                input_ids,
                input_mask=None,
                token_type_ids=None,
-               use_one_hot_embeddings=True,
+               use_one_hot_embeddings=False,
                scope=None):
     """Constructor for BertModel.
 
@@ -169,9 +171,12 @@ class BertModel(object):
     if token_type_ids is None:
       token_type_ids = tf.zeros(shape=[batch_size, seq_length], dtype=tf.int32)
 
-    with tf.variable_scope(scope, default_name="bert"):
+    with tf.variable_scope(scope, default_name="bert"):  # 输入准备, 进行position embedding
+
       with tf.variable_scope("embeddings"):
         # Perform embedding lookup on the word ids.
+        # embedding_output: [batch, seq_len, emd_size]
+        # embedding_table: [vocab_size, emd_size]  初始化的词向量矩阵
         (self.embedding_output, self.embedding_table) = embedding_lookup(
             input_ids=input_ids,
             vocab_size=config.vocab_size,
@@ -182,7 +187,7 @@ class BertModel(object):
 
         # Add positional embeddings and token type embeddings, then layer
         # normalize and perform dropout.
-        self.embedding_output = embedding_postprocessor(
+        self.embedding_output = embedding_postprocessor(  # [batch, seq_len, emd_size]
             input_tensor=self.embedding_output,
             use_token_type=True,
             token_type_ids=token_type_ids,
@@ -201,6 +206,8 @@ class BertModel(object):
         attention_mask = create_attention_mask_from_input_mask(
             input_ids, input_mask)
 
+        print("{}_{}_{}".format(206, np.shape(attention_mask), attention_mask))
+
         # Run the stacked transformer.
         # `sequence_output` shape = [batch_size, seq_length, hidden_size].
         self.all_encoder_layers = transformer_model(
@@ -216,7 +223,7 @@ class BertModel(object):
             initializer_range=config.initializer_range,
             do_return_all_layers=True)
 
-      self.sequence_output = self.all_encoder_layers[-1]
+      self.sequence_output = self.all_encoder_layers[-1]  # [batch_size, seq_length, hidden_size]
       # The "pooler" converts the encoded sequence tensor of shape
       # [batch_size, seq_length, hidden_size] to a tensor of shape
       # [batch_size, hidden_size]. This is necessary for segment-level
@@ -225,6 +232,7 @@ class BertModel(object):
       with tf.variable_scope("pooler"):
         # We "pool" the model by simply taking the hidden state corresponding
         # to the first token. We assume that this has been pre-trained
+        # 分类任务只取第一个输出，[batch_size, hidden_size]
         first_token_tensor = tf.squeeze(self.sequence_output[:, 0:1, :], axis=1)
         self.pooled_output = tf.layers.dense(
             first_token_tensor,
@@ -408,7 +416,7 @@ def embedding_lookup(input_ids,
   if input_ids.shape.ndims == 2:
     input_ids = tf.expand_dims(input_ids, axis=[-1])
 
-  embedding_table = tf.get_variable(
+  embedding_table = tf.get_variable(  # 初始化一个词向量矩阵，用作选词之用
       name=word_embedding_name,
       shape=[vocab_size, embedding_size],
       initializer=create_initializer(initializer_range))
@@ -422,8 +430,12 @@ def embedding_lookup(input_ids,
 
   input_shape = get_shape_list(input_ids)
 
+
   output = tf.reshape(output,
                       input_shape[0:-1] + [input_shape[-1] * embedding_size])
+
+  print('{}_{}_input_shape: {}'.format(424, 'embedding_lookup', output))
+
   return (output, embedding_table)
 
 
@@ -467,7 +479,7 @@ def embedding_postprocessor(input_tensor,
   input_shape = get_shape_list(input_tensor, expected_rank=3)
   batch_size = input_shape[0]
   seq_length = input_shape[1]
-  width = input_shape[2]
+  width = input_shape[2]  # emd_size
 
   output = input_tensor
 
@@ -481,20 +493,21 @@ def embedding_postprocessor(input_tensor,
         initializer=create_initializer(initializer_range))
     # This vocab will be small so we always do one-hot here, since it is always
     # faster for a small vocabulary.
-    flat_token_type_ids = tf.reshape(token_type_ids, [-1])
-    one_hot_ids = tf.one_hot(flat_token_type_ids, depth=token_type_vocab_size)
-    token_type_embeddings = tf.matmul(one_hot_ids, token_type_table)
+    flat_token_type_ids = tf.reshape(token_type_ids, [-1])  # batch_size * seq_len
+    one_hot_ids = tf.one_hot(flat_token_type_ids, depth=token_type_vocab_size)  # [batch * seq_len, vob]
+    token_type_embeddings = tf.matmul(one_hot_ids, token_type_table)  # [batch * seq, emb_size]
     token_type_embeddings = tf.reshape(token_type_embeddings,
                                        [batch_size, seq_length, width])
     output += token_type_embeddings
 
   if use_position_embeddings:
+    # 保护性措施，要求句子长度均小于max_len
     assert_op = tf.assert_less_equal(seq_length, max_position_embeddings)
     with tf.control_dependencies([assert_op]):
       full_position_embeddings = tf.get_variable(
           name=position_embedding_name,
           shape=[max_position_embeddings, width],
-          initializer=create_initializer(initializer_range))
+          initializer=create_initializer(initializer_range))  # 在BERT中改用可训练的位置信息编码，区别于纯Transformer
       # Since the position embedding table is a learned variable, we create it
       # using a (long) sequence length `max_position_embeddings`. The actual
       # sequence length might be shorter than this, for faster training of
@@ -636,8 +649,8 @@ def attention_layer(from_tensor,
     output_tensor = tf.transpose(output_tensor, [0, 2, 1, 3])
     return output_tensor
 
-  from_shape = get_shape_list(from_tensor, expected_rank=[2, 3])
-  to_shape = get_shape_list(to_tensor, expected_rank=[2, 3])
+  from_shape = get_shape_list(from_tensor, expected_rank=[2, 3])  # query
+  to_shape = get_shape_list(to_tensor, expected_rank=[2, 3])  # value and key
 
   if len(from_shape) != len(to_shape):
     raise ValueError(
@@ -660,11 +673,15 @@ def attention_layer(from_tensor,
   #   T = `to_tensor` sequence length
   #   N = `num_attention_heads`
   #   H = `size_per_head`
+  #   E = 'hidden_size'
 
-  from_tensor_2d = reshape_to_matrix(from_tensor)
-  to_tensor_2d = reshape_to_matrix(to_tensor)
+  from_tensor_2d = reshape_to_matrix(from_tensor)  # [B*F, E]
+  to_tensor_2d = reshape_to_matrix(to_tensor)  # [B*T, E]
 
-  # `query_layer` = [B*F, N*H]
+  print('{}_{} --> {}: {}'.format(675, 'shape', 'from_tensor_2d', np.shape(from_tensor_2d)))
+  print('{}_{} --> {}: {}'.format(676, 'shape', 'to_tensor_2d', np.shape(to_tensor_2d)))
+
+  # `query_layer` = [B*F, N*H=E]
   query_layer = tf.layers.dense(
       from_tensor_2d,
       num_attention_heads * size_per_head,
@@ -672,15 +689,15 @@ def attention_layer(from_tensor,
       name="query",
       kernel_initializer=create_initializer(initializer_range))
 
-  # `key_layer` = [B*T, N*H]
+  # `key_layer` = [B*T, N*H=E]
   key_layer = tf.layers.dense(
       to_tensor_2d,
-      num_attention_heads * size_per_head,
+      num_attention_heads * size_per_head,  # N*H = E, 这一步是为了做一个统一，统一成hidden_size
       activation=key_act,
       name="key",
       kernel_initializer=create_initializer(initializer_range))
 
-  # `value_layer` = [B*T, N*H]
+  # `value_layer` = [B*T, N*H=E]
   value_layer = tf.layers.dense(
       to_tensor_2d,
       num_attention_heads * size_per_head,
@@ -688,7 +705,8 @@ def attention_layer(from_tensor,
       name="value",
       kernel_initializer=create_initializer(initializer_range))
 
-  # `query_layer` = [B, N, F, H]
+  # `query_layer`([B*F, N*H]) = [B, N, F, H]
+  #  N组，最后两项是query的句子长度和词向量的宽度，这里面是hidden/head_num
   query_layer = transpose_for_scores(query_layer, batch_size,
                                      num_attention_heads, from_seq_length,
                                      size_per_head)
@@ -702,9 +720,9 @@ def attention_layer(from_tensor,
   # `attention_scores` = [B, N, F, T]
   attention_scores = tf.matmul(query_layer, key_layer, transpose_b=True)
   attention_scores = tf.multiply(attention_scores,
-                                 1.0 / math.sqrt(float(size_per_head)))
+                                 1.0 / math.sqrt(float(size_per_head)))  # 正则化，防止q.k过大导致sigmoid饱和导数趋近于零
 
-  if attention_mask is not None:
+  if attention_mask is not None:  # 消除padding项对attention结果的影响
     # `attention_mask` = [B, 1, F, T]
     attention_mask = tf.expand_dims(attention_mask, axis=[1])
 
@@ -715,7 +733,7 @@ def attention_layer(from_tensor,
 
     # Since we are adding it to the raw scores before the softmax, this is
     # effectively the same as removing these entirely.
-    attention_scores += adder
+    attention_scores += adder  # 这样经过softmax之后，padding的地方会概率无限接近于0。
 
   # Normalize the attention scores to probabilities.
   # `attention_probs` = [B, N, F, T]
@@ -740,12 +758,12 @@ def attention_layer(from_tensor,
   context_layer = tf.transpose(context_layer, [0, 2, 1, 3])
 
   if do_return_2d_tensor:
-    # `context_layer` = [B*F, N*V]
+    # `context_layer` = [B*F, N*H]
     context_layer = tf.reshape(
         context_layer,
         [batch_size * from_seq_length, num_attention_heads * size_per_head])
   else:
-    # `context_layer` = [B, F, N*V]
+    # `context_layer` = [B, F, N*H=E]
     context_layer = tf.reshape(
         context_layer,
         [batch_size, from_seq_length, num_attention_heads * size_per_head])
@@ -825,14 +843,14 @@ def transformer_model(input_tensor,
   prev_output = reshape_to_matrix(input_tensor)
 
   all_layer_outputs = []
-  for layer_idx in range(num_hidden_layers):
+  for layer_idx in range(num_hidden_layers):  # number of blocks
     with tf.variable_scope("layer_%d" % layer_idx):
       layer_input = prev_output
 
       with tf.variable_scope("attention"):
         attention_heads = []
         with tf.variable_scope("self"):
-          attention_head = attention_layer(
+          attention_head = attention_layer(  # [batch*from_seq_len, hidden_size]
               from_tensor=layer_input,
               to_tensor=layer_input,
               attention_mask=attention_mask,
@@ -844,6 +862,9 @@ def transformer_model(input_tensor,
               batch_size=batch_size,
               from_seq_length=seq_length,
               to_seq_length=seq_length)
+
+          print('{}_{}-->{}: {}'.format(862, 'shape', 'attention_head', np.shape(attention_head)))
+
           attention_heads.append(attention_head)
 
         attention_output = None
@@ -854,6 +875,8 @@ def transformer_model(input_tensor,
           # them to the self-attention head before the projection.
           attention_output = tf.concat(attention_heads, axis=-1)
 
+          print('{}_{}-->{}: {}'.format(873, 'shape', 'attention_output', np.shape(attention_output)))
+
         # Run a linear projection of `hidden_size` then add a residual
         # with `layer_input`.
         with tf.variable_scope("output"):
@@ -862,7 +885,8 @@ def transformer_model(input_tensor,
               hidden_size,
               kernel_initializer=create_initializer(initializer_range))
           attention_output = dropout(attention_output, hidden_dropout_prob)
-          attention_output = layer_norm(attention_output + layer_input)
+          attention_output = layer_norm(attention_output + layer_input)  # 有残差
+          print('{}_{}-->{}: {}'.format(888, 'shape', 'attention_output', np.shape(attention_output)))
 
       # The activation is only applied to the "intermediate" hidden layer.
       with tf.variable_scope("intermediate"):
@@ -871,6 +895,7 @@ def transformer_model(input_tensor,
             intermediate_size,
             activation=intermediate_act_fn,
             kernel_initializer=create_initializer(initializer_range))
+        print('{}_{}-->{}: {}'.format(893, 'shape', 'intermediate_output', np.shape(intermediate_output)))
 
       # Down-project back to `hidden_size` then add the residual.
       with tf.variable_scope("output"):
@@ -880,17 +905,21 @@ def transformer_model(input_tensor,
             kernel_initializer=create_initializer(initializer_range))
         layer_output = dropout(layer_output, hidden_dropout_prob)
         layer_output = layer_norm(layer_output + attention_output)
+        print('{}_{}-->{}: {}'.format(907, 'shape', 'layer_output', np.shape(layer_output)))
         prev_output = layer_output
         all_layer_outputs.append(layer_output)
+        print('i am here')
 
   if do_return_all_layers:
     final_outputs = []
     for layer_output in all_layer_outputs:
       final_output = reshape_from_matrix(layer_output, input_shape)
       final_outputs.append(final_output)
+    print('{}_{}-->{}: {}'.format(917, 'shape', 'final_outputs', np.shape(final_outputs)))
     return final_outputs
   else:
     final_output = reshape_from_matrix(prev_output, input_shape)
+    print('{}_{}-->{}: {}'.format(920, 'shape', 'final_output', np.shape(final_output)))
     return final_output
 
 
